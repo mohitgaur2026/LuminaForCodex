@@ -130,11 +130,12 @@
                         if (seg.segment.trim()) sentences.push({ text: seg.segment, start: seg.index, length: seg.segment.length });
                     }
                 } else {
-                    const split = text.split(/([.?!]\s+)/);
-                    let offset = 0;
-                    for (const s of split) {
-                        if (s.trim()) sentences.push({ text: s, start: offset, length: s.length });
-                        offset += s.length;
+                    const sentenceRegex = /[^.!?]+[.!?]+(?:\s+|$)|[^.!?]+$/g;
+                    let match;
+                    while ((match = sentenceRegex.exec(text)) !== null) {
+                        const segmentText = match[0];
+                        if (!segmentText.trim()) continue;
+                        sentences.push({ text: segmentText, start: match.index, length: segmentText.length });
                     }
                 }
                 return sentences;
@@ -231,6 +232,28 @@
                     if (window.__luminaInitialized) return;
                     window.__luminaInitialized = true;
 
+                    const segmentSentences = (text) => {
+                        const segments = [];
+                        if (!text) return segments;
+
+                        if (window.Intl && Intl.Segmenter) {
+                            const sentenceSegmenter = new Intl.Segmenter('en', { granularity: 'sentence' });
+                            for (const seg of sentenceSegmenter.segment(text)) {
+                                if (!seg.segment.trim()) continue;
+                                segments.push({ start: seg.index, end: seg.index + seg.segment.length });
+                            }
+                        } else {
+                            const sentenceRegex = /[^.!?]+[.!?]+(?:\\s+|$)|[^.!?]+$/g;
+                            let match;
+                            while ((match = sentenceRegex.exec(text)) !== null) {
+                                if (!match[0].trim()) continue;
+                                segments.push({ start: match.index, end: match.index + match[0].length });
+                            }
+                        }
+
+                        return segments;
+                    };
+
                     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
                     const textNodes = [];
                     while (walker.nextNode()) textNodes.push(walker.currentNode);
@@ -238,16 +261,25 @@
                     textNodes.forEach(node => {
                         const text = node.nodeValue;
                         if (!text.trim() || node.parentNode.nodeName === 'SCRIPT' || node.parentNode.nodeName === 'STYLE') return;
-                        const split = text.split(/([.?!]\\s+)/);
                         const frag = document.createDocumentFragment();
-                        split.forEach(s => {
-                            if(s.trim()) {
+                        const segments = segmentSentences(text);
+                        let cursor = 0;
+
+                        segments.forEach(seg => {
+                            if (seg.start > cursor) frag.appendChild(document.createTextNode(text.slice(cursor, seg.start)));
+                            const sentenceText = text.slice(seg.start, seg.end);
+                            if (sentenceText.trim()) {
                                 const span = document.createElement('span');
-                                span.className = 'lumina-sentence'; span.dataset.idx = globalIdx; span.textContent = s;
+                                span.className = 'lumina-sentence'; span.dataset.idx = globalIdx; span.textContent = sentenceText;
                                 span.addEventListener('click', () => window.parent.postMessage({ type: 'SEEK', index: parseInt(span.dataset.idx) }, '*'));
-                                frag.appendChild(span); sentences.push({ text: s }); globalIdx++;
-                            } else { frag.appendChild(document.createTextNode(s)); }
+                                frag.appendChild(span); sentences.push({ text: sentenceText }); globalIdx++;
+                            } else {
+                                frag.appendChild(document.createTextNode(sentenceText));
+                            }
+                            cursor = seg.end;
                         });
+
+                        if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
                         node.parentNode.replaceChild(frag, node);
                     });
                     window.parent.postMessage({ type: 'READY', sentences }, '*');
@@ -580,9 +612,12 @@
             useEffect(() => {
                 if (playback.isPlaying) speak(playback.index);
                 else synth.current.cancel();
-            }, [playback.isPlaying, speak]);
+            }, [playback.isPlaying, playback.index, speak]);
 
-            const handleSeek = (idx) => { setPlayback({ index: idx, isPlaying: true }); };
+            const handleSeek = (idx) => {
+                synth.current.cancel();
+                setPlayback({ index: idx, isPlaying: true });
+            };
 
             const closeDocument = () => {
                 setDocState({ id: 'welcome', type: 'text', content: DEFAULT_WELCOME, title: "Welcome" });
