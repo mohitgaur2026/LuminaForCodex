@@ -1,0 +1,867 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Lumina Reader - Ultimate</title>
+    <meta name="theme-color" content="#ffffff">
+    
+    <!-- External Libraries -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- JSZip for EPUB -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <!-- DOCX Generation -->
+    <script src="https://cdn.jsdelivr.net/npm/html-docx-js@0.3.1/dist/html-docx.min.js"></script>
+
+    <!-- Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600&family=Inter:wght@300;400;500;600&family=Lora:ital,wght@0,400;0,600;1,400&family=Merriweather:wght@300;400;700&family=Montserrat:wght@300;400;500&family=Playfair+Display:wght@400;700&display=swap" rel="stylesheet">
+    
+    <style>
+        body { font-family: 'Inter', sans-serif; overscroll-behavior: none; -webkit-tap-highlight-color: transparent; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        .animate-pop { animation: popIn 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+        @keyframes popIn { from { opacity: 0; transform: translate(-50%, 10px) scale(0.9); } to { opacity: 1; transform: translate(-50%, 0) scale(1); } }
+        
+        /* Font Classes */
+        .font-serif { font-family: 'Merriweather', serif; }
+        .font-playfair { font-family: 'Playfair Display', serif; }
+        .font-cormorant { font-family: 'Cormorant Garamond', serif; }
+        .font-lora { font-family: 'Lora', serif; }
+        .font-montserrat { font-family: 'Montserrat', sans-serif; }
+        .font-inter { font-family: 'Inter', sans-serif; }
+
+        /* Reader Layout */
+        .reader-content { white-space: pre-wrap; text-align: justify; line-height: 1.8; }
+        
+        /* Highlights & TTS */
+        ::selection { background: #e0e7ff; color: #312e81; }
+        .word-active { border-bottom: 2px solid #4f46e5; background-color: rgba(99, 102, 241, 0.15); }
+        .hl-yellow { background-color: #fef08a; color: #000; }
+        .hl-green { background-color: #bbf7d0; color: #000; }
+        .hl-pink { background-color: #fbcfe8; color: #000; }
+        .hl-blue { background-color: #bfdbfe; color: #000; }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-900 overflow-hidden">
+    <div id="root" class="h-screen w-screen flex flex-col"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+        // --- CORE UTILS & DATABASE ---
+        const Colors = { yellow: '#fef08a', green: '#bbf7d0', pink: '#fbcfe8', blue: '#bfdbfe' };
+        
+        const DB = {
+            db: null,
+            async init() {
+                return new Promise((resolve, reject) => {
+                    const req = indexedDB.open('LuminaUltimateDB', 1);
+                    req.onupgradeneeded = (e) => {
+                        const db = e.target.result;
+                        if (!db.objectStoreNames.contains('state')) db.createObjectStore('state');
+                        if (!db.objectStoreNames.contains('assets')) db.createObjectStore('assets');
+                        if (!db.objectStoreNames.contains('history')) db.createObjectStore('history', { keyPath: 'id', autoIncrement: true });
+                    };
+                    req.onsuccess = (e) => { this.db = e.target.result; resolve(); };
+                    req.onerror = reject;
+                });
+            },
+            async get(store, key) {
+                if (!this.db) await this.init();
+                return new Promise(res => {
+                    const req = this.db.transaction(store, 'readonly').objectStore(store).get(key);
+                    req.onsuccess = () => res(req.result);
+                    req.onerror = () => res(null);
+                });
+            },
+            async getAll(store) {
+                if (!this.db) await this.init();
+                return new Promise(res => {
+                    const req = this.db.transaction(store, 'readonly').objectStore(store).getAll();
+                    req.onsuccess = () => res(req.result || []);
+                    req.onerror = () => res([]);
+                });
+            },
+            async set(store, key, val) {
+                if (!this.db) await this.init();
+                return new Promise(res => {
+                    const tx = this.db.transaction(store, 'readwrite');
+                    if (key === null) tx.objectStore(store).add(val);
+                    else tx.objectStore(store).put(val, key);
+                    tx.oncomplete = res;
+                });
+            },
+            async delete(store, key) {
+                if (!this.db) await this.init();
+                return new Promise(res => {
+                    const tx = this.db.transaction(store, 'readwrite');
+                    tx.objectStore(store).delete(key);
+                    tx.oncomplete = res;
+                });
+            },
+            async addHistory(docState) {
+                if (!docState || !docState.content || docState.id === 'welcome') return;
+                const title = docState.title || "Document";
+                const all = await this.getAll('history');
+                const existing = all.find(x => x.title === title);
+                if (existing) await this.delete('history', existing.id);
+                await this.set('history', null, { docState, date: new Date().toISOString(), title });
+                const updated = await this.getAll('history');
+                if (updated.length > 10) await this.delete('history', updated[0].id);
+            }
+        };
+
+        // --- PARSER ---
+        const Parser = {
+            tokenize(text) {
+                const sentences = [];
+                if (!text) return sentences;
+                if (window.Intl && Intl.Segmenter) {
+                    const segmenter = new Intl.Segmenter('en', { granularity: 'sentence' });
+                    for (const seg of segmenter.segment(text)) {
+                        if (seg.segment.trim()) sentences.push({ text: seg.segment, start: seg.index, length: seg.segment.length });
+                    }
+                } else {
+                    const split = text.split(/([.?!]\s+)/);
+                    let offset = 0;
+                    for (const s of split) {
+                        if (s.trim()) sentences.push({ text: s, start: offset, length: s.length });
+                        offset += s.length;
+                    }
+                }
+                return sentences;
+            },
+            async parseEpub(file) {
+                try {
+                    const zip = await window.JSZip.loadAsync(file);
+                    let text = "";
+                    const container = await zip.file("META-INF/container.xml")?.async("string");
+                    if (!container) throw new Error("Invalid EPUB format");
+                    
+                    const doc = new DOMParser().parseFromString(container, "application/xml");
+                    const rootfile = doc.querySelector("rootfile");
+                    const opfPath = rootfile.getAttribute("full-path");
+                    const opfDir = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/')) : '';
+                    const opfContent = await zip.file(opfPath)?.async("string");
+                    
+                    const opfDoc = new DOMParser().parseFromString(opfContent, "application/xml");
+                    const manifest = {};
+                    opfDoc.querySelectorAll("manifest > item").forEach(i => manifest[i.id] = i.getAttribute("href") || "");
+                    const spineRefs = Array.from(opfDoc.querySelectorAll("spine > itemref")).map(r => r.getAttribute("idref"));
+                    
+                    for (const id of spineRefs) {
+                        if (!id) continue;
+                        let path = manifest[id];
+                        if (opfDir && path) path = opfDir + '/' + path;
+                        else if (!path) continue;
+                        const htmlFile = zip.file(path) || zip.file(decodeURIComponent(path));
+                        if (!htmlFile) continue;
+                        
+                        const html = await htmlFile.async("string");
+                        const hDoc = new DOMParser().parseFromString(html, "text/html");
+                        hDoc.body.querySelectorAll('p, div, h1, h2, br').forEach(el => el.prepend('\n'));
+                        text += hDoc.body.textContent + "\n";
+                    }
+                    return text.replace(/\n\s*\n/g, '\n\n').trim() || "No readable text extracted.";
+                } catch (e) {
+                    console.error("EPUB Parse Error:", e);
+                    throw e;
+                }
+            },
+            exportDocx(text, highlights, fontSettings) {
+                const fontFamily = fontSettings.family || 'Times New Roman';
+                let htmlContent = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>body { font-family: '${fontFamily}', serif; line-height: 1.5; font-size: 12pt; text-align: justify; } p { margin-bottom: 1em; }</style></head><body>`;
+                const paragraphs = text.split('\n');
+                let currentGlobalIndex = 0;
+                const sortedHighlights = [...highlights].sort((a, b) => a.start - b.start);
+
+                paragraphs.forEach(para => {
+                    if (!para.trim()) { htmlContent += "<p>&nbsp;</p>"; currentGlobalIndex += 1; return; }
+                    const pStart = currentGlobalIndex;
+                    const pEnd = pStart + para.length;
+                    const relevant = sortedHighlights.filter(h => h.end > pStart && h.start < pEnd);
+
+                    if (relevant.length === 0) htmlContent += `<p>${para}</p>`;
+                    else {
+                        let paraHtml = "<p>";
+                        const points = new Set([0, para.length]);
+                        relevant.forEach(h => { points.add(Math.max(0, h.start - pStart)); points.add(Math.min(para.length, h.end - pStart)); });
+                        const sortedPoints = Array.from(points).sort((a, b) => a - b);
+                        for (let i = 0; i < sortedPoints.length - 1; i++) {
+                            const segText = para.substring(sortedPoints[i], sortedPoints[i+1]);
+                            if (!segText) continue;
+                            const absMid = pStart + sortedPoints[i] + (sortedPoints[i+1] - sortedPoints[i]) / 2;
+                            const activeHl = relevant.find(h => h.start <= absMid && h.end >= absMid);
+                            paraHtml += activeHl ? `<span style="background-color: ${Colors[activeHl.color] || '#fef08a'}">${segText}</span>` : segText;
+                        }
+                        paraHtml += "</p>";
+                        htmlContent += paraHtml;
+                    }
+                    currentGlobalIndex += para.length + 1;
+                });
+                htmlContent += "</body></html>";
+                const converted = window.htmlDocx.asBlob(htmlContent);
+                const url = URL.createObjectURL(converted);
+                const a = document.createElement('a'); a.href = url; a.download = `Export.docx`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+            }
+        };
+
+        const getIframeScript = () => `
+            <style>
+                body { padding: 16px; line-height: 1.6; max-width: 100vw; overflow-x: hidden; box-sizing: border-box; }
+                @media(min-width: 768px) { body { padding: 32px; font-size: 110%; } }
+                ::selection { background: #e0e7ff; color: #312e81; }
+                .lumina-sentence { transition: background 0.2s; border-radius: 2px; }
+                .lumina-active { background: rgba(99, 102, 241, 0.2) !important; box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.4); }
+                .lumina-hl-yellow { background-color: rgba(254, 240, 138, 0.8) !important; }
+                .lumina-hl-green { background-color: rgba(187, 247, 208, 0.8) !important; }
+                .lumina-hl-pink { background-color: rgba(251, 207, 232, 0.8) !important; }
+                .lumina-hl-blue { background-color: rgba(191, 219, 254, 0.8) !important; }
+            </style>
+            <script>
+                function initLumina() {
+                    if (window.__luminaInitialized) return;
+                    window.__luminaInitialized = true;
+
+                    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+                    const textNodes = [];
+                    while (walker.nextNode()) textNodes.push(walker.currentNode);
+                    let globalIdx = 0; const sentences = [];
+                    textNodes.forEach(node => {
+                        const text = node.nodeValue;
+                        if (!text.trim() || node.parentNode.nodeName === 'SCRIPT' || node.parentNode.nodeName === 'STYLE') return;
+                        const split = text.split(/([.?!]\\s+)/);
+                        const frag = document.createDocumentFragment();
+                        split.forEach(s => {
+                            if(s.trim()) {
+                                const span = document.createElement('span');
+                                span.className = 'lumina-sentence'; span.dataset.idx = globalIdx; span.textContent = s;
+                                span.addEventListener('click', () => window.parent.postMessage({ type: 'SEEK', index: parseInt(span.dataset.idx) }, '*'));
+                                frag.appendChild(span); sentences.push({ text: s }); globalIdx++;
+                            } else { frag.appendChild(document.createTextNode(s)); }
+                        });
+                        node.parentNode.replaceChild(frag, node);
+                    });
+                    window.parent.postMessage({ type: 'READY', sentences }, '*');
+                }
+
+                window.addEventListener('DOMContentLoaded', initLumina);
+                if (document.readyState === 'complete' || document.readyState === 'interactive') {
+                    setTimeout(initLumina, 10);
+                }
+
+                window.addEventListener('message', (e) => {
+                    if (e.data.type === 'PLAY') {
+                        document.querySelectorAll('.lumina-active').forEach(el => el.classList.remove('lumina-active'));
+                        const el = document.querySelector(\`[data-idx="\${e.data.index}"]\`);
+                        if(el) { el.classList.add('lumina-active'); el.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+                    } else if (e.data.type === 'HIGHLIGHT') {
+                        const sel = window.getSelection();
+                        if (!sel.isCollapsed) {
+                            const range = sel.getRangeAt(0); const span = document.createElement('span'); span.className = 'lumina-hl-' + e.data.color;
+                            range.surroundContents(span); sel.removeAllRanges();
+                            window.parent.postMessage({ type: 'HIGHLIGHT_ADDED', html: document.body.innerHTML }, '*');
+                        }
+                    } else if (e.data.type === 'LOAD_STATE') {
+                        if(e.data.html) document.body.innerHTML = e.data.html;
+                        initLumina();
+                    }
+                });
+                document.addEventListener('mouseup', () => { window.parent.postMessage({ type: 'SELECTION_CHANGE' }, '*'); });
+            <\/script>
+        `;
+
+        // --- COMPONENTS ---
+
+        const WebViewer = ({ htmlContent, isPlaying, playbackIndex, onSentencesReady, onHighlightCmd, onAddHighlight, onSeek }) => {
+            const iframeRef = useRef(null);
+            
+            useEffect(() => {
+                const doc = iframeRef.current?.contentDocument;
+                if(doc) { 
+                    doc.open(); 
+                    
+                    let finalHtml = htmlContent;
+                    const scriptTag = getIframeScript();
+                    
+                    if (finalHtml.includes('</head>')) {
+                        finalHtml = finalHtml.replace('</head>', scriptTag + '</head>');
+                    } else if (finalHtml.includes('</body>')) {
+                        finalHtml = finalHtml.replace('</body>', scriptTag + '</body>');
+                    } else {
+                        finalHtml += scriptTag;
+                    }
+                    
+                    doc.write(finalHtml); 
+                    doc.close(); 
+                }
+            }, [htmlContent]);
+
+            useEffect(() => {
+                const handleMsg = (e) => {
+                    if (e.data.type === 'READY') onSentencesReady(e.data.sentences);
+                    if (e.data.type === 'SEEK' && onSeek) onSeek(e.data.index);
+                    if (e.data.type === 'HIGHLIGHT_ADDED') onAddHighlight(e.data.html);
+                };
+                window.addEventListener('message', handleMsg);
+                return () => window.removeEventListener('message', handleMsg);
+            }, []);
+
+            useEffect(() => { if (isPlaying) iframeRef.current?.contentWindow?.postMessage({ type: 'PLAY', index: playbackIndex }, '*'); }, [isPlaying, playbackIndex]);
+            useEffect(() => { if (onHighlightCmd) iframeRef.current?.contentWindow?.postMessage({ type: 'HIGHLIGHT', color: onHighlightCmd }, '*'); }, [onHighlightCmd]);
+            
+            return <iframe ref={iframeRef} className="w-full h-full border-none bg-white" sandbox="allow-same-origin allow-scripts" />;
+        };
+
+        const TextViewer = ({ text, sentences, playbackIndex, isPlaying, activeWord, highlights, onHighlight, onSeek, settings }) => {
+            const containerRef = useRef(null);
+            const [contextMenu, setContextMenu] = useState(null);
+
+            useEffect(() => {
+                if (isPlaying && sentences[playbackIndex]) {
+                    const el = containerRef.current?.querySelector(`[data-idx="${playbackIndex}"]`);
+                    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+            }, [playbackIndex, isPlaying]);
+
+            useEffect(() => {
+                const checkSel = () => {
+                    const sel = window.getSelection();
+                    if (!sel || sel.isCollapsed) return setContextMenu(null);
+                    if (!containerRef.current?.contains(sel.anchorNode)) return;
+                    const rect = sel.getRangeAt(0).getBoundingClientRect();
+                    setContextMenu({ x: rect.left + rect.width/2, y: rect.bottom + 12 });
+                };
+                document.addEventListener('selectionchange', () => setTimeout(checkSel, 10));
+                return () => document.removeEventListener('selectionchange', checkSel);
+            }, []);
+
+            const applyHighlight = (color) => {
+                const sel = window.getSelection();
+                if (!sel || sel.isCollapsed) return;
+                const range = sel.getRangeAt(0);
+                const getSentenceIdx = (node) => {
+                    let curr = node.nodeType === 3 ? node.parentNode : node;
+                    while (curr && curr !== containerRef.current) {
+                        if (curr.getAttribute('data-idx') !== null) return parseInt(curr.getAttribute('data-idx'));
+                        curr = curr.parentNode;
+                    }
+                    return -1;
+                };
+                const sIdx = getSentenceIdx(range.startContainer);
+                const eIdx = getSentenceIdx(range.endContainer);
+                if (sIdx === -1 || eIdx === -1) return setContextMenu(null);
+
+                const getOffset = (node, offset, idx) => {
+                    const container = containerRef.current.querySelector(`[data-idx="${idx}"]`);
+                    const r = document.createRange(); r.setStart(container, 0); r.setEnd(node, offset);
+                    return r.toString().length;
+                };
+                const sOff = getOffset(range.startContainer, range.startOffset, sIdx);
+                const eOff = getOffset(range.endContainer, range.endOffset, eIdx);
+                onHighlight({ start: sentences[sIdx].start + sOff, end: sentences[eIdx].start + eOff, color, id: Date.now() });
+                sel.removeAllRanges(); setContextMenu(null);
+            };
+
+            const segmentText = (text, offset, length, activeRange) => {
+                const segments = [];
+                const points = new Set([0, length]);
+                const relevant = highlights.filter(h => h.end > offset && h.start < offset + length);
+                relevant.forEach(h => { points.add(Math.max(0, h.start - offset)); points.add(Math.min(length, h.end - offset)); });
+                if (activeRange) { points.add(Math.max(0, activeRange.start)); points.add(Math.min(length, activeRange.end)); }
+                
+                const sorted = Array.from(points).sort((a,b)=>a-b);
+                for (let i=0; i<sorted.length-1; i++) {
+                    const s = sorted[i], e = sorted[i+1];
+                    const segText = text.substring(s, e);
+                    if (!segText) continue;
+                    const absMid = offset + s + (e-s)/2;
+                    const hl = relevant.find(h => h.start <= absMid && h.end >= absMid);
+                    const isActive = activeRange && (activeRange.start <= s && activeRange.end > s);
+                    segments.push({ text: segText, color: hl?.color, isActive });
+                }
+                return segments;
+            };
+
+            return (
+                <div className={`relative p-5 md:p-10 font-${settings.fontFamily}`} style={{ fontSize: settings.textSize + 'px' }}>
+                    {contextMenu && (
+                        <div 
+                            className="fixed z-50 flex gap-3 p-3 bg-white rounded-full shadow-[0_4px_20px_rgba(0,0,0,0.15)] border border-gray-100 transform -translate-x-1/2 animate-pop" 
+                            style={{ 
+                                left: Math.max(90, Math.min(window.innerWidth - 90, contextMenu.x)), 
+                                top: contextMenu.y 
+                            }} 
+                            onMouseDown={e => e.preventDefault()}
+                        >
+                            <div className="absolute -top-2 left-1/2 transform -translate-x-1/2 w-0 h-0 border-l-[8px] border-l-transparent border-r-[8px] border-r-transparent border-b-[8px] border-b-white"></div>
+                            {['yellow', 'green', 'pink', 'blue'].map(c => (
+                                <button key={c} onClick={() => applyHighlight(c)} className="w-8 h-8 rounded-full border-2 border-white shadow hover:scale-110 transition-transform" style={{ backgroundColor: Colors[c] }} />
+                            ))}
+                        </div>
+                    )}
+                    <article ref={containerRef} className="max-w-3xl mx-auto leading-loose text-justify whitespace-pre-wrap outline-none">
+                        {sentences.map((sent, i) => {
+                            const isCurrent = i === playbackIndex;
+                            const activeRange = (isCurrent && isPlaying) ? activeWord : null;
+                            const segments = segmentText(sent.text, sent.start, sent.length, activeRange);
+                            let cls = "transition-colors duration-150 rounded px-[2px] -mx-[2px] cursor-pointer inline ";
+                            if (isCurrent && isPlaying) cls += "bg-gray-100 shadow-[0_0_0_2px_#e5e7eb] ";
+                            return (
+                                <span key={i} data-idx={i} className={cls} onClick={() => { if(window.getSelection().isCollapsed) onSeek(i); }}>
+                                    {segments.map((seg, idx) => (
+                                        <span key={idx} className={`${seg.color ? 'hl-'+seg.color : ''} ${seg.isActive ? 'word-active' : ''}`}>{seg.text}</span>
+                                    ))}
+                                    {' '}
+                                </span>
+                            );
+                        })}
+                    </article>
+                </div>
+            );
+        };
+
+        // --- MAIN APP ---
+        const DEFAULT_WELCOME = "Welcome to Lumina Reader Ultimate.\n\nUse the sidebar to import Webpages, EPUBs, or Google Docs. You can highlight text, change fonts, and export to DOCX/PDF.\n\nLumina seamlessly adapts to your screen layout and preserves spacing while reading aloud.";
+
+        const App = () => {
+            const [isLoading, setIsLoading] = useState(false);
+            const [docState, setDocState] = useState({ id: 'welcome', type: 'text', content: DEFAULT_WELCOME, title: "Welcome" });
+            const [sentences, setSentences] = useState([]);
+            const [highlights, setHighlights] = useState([]); 
+            const [htmlMod, setHtmlMod] = useState(null);
+            
+            const [playback, setPlayback] = useState({ index: 0, isPlaying: false });
+            const [activeWord, setActiveWord] = useState(null);
+            const [settings, setSettings] = useState({ rate: 1.0, voiceURI: '', textSize: 18, fontFamily: 'serif' });
+            
+            const [uiState, setUiState] = useState({ sidebarOpen: false, isFullscreen: false, isEditMode: false });
+            const [assets, setAssets] = useState({ bgImage: null, bgAudio: null });
+            const [isMusicPlaying, setIsMusicPlaying] = useState(true);
+            const [history, setHistory] = useState([]);
+            const [voices, setVoices] = useState([]);
+
+            const synth = useRef(window.speechSynthesis);
+            const utteranceRef = useRef(null);
+            const audioRef = useRef(null);
+
+            useEffect(() => {
+                if (audioRef.current) {
+                    if (isMusicPlaying && assets.bgAudio) audioRef.current.play().catch(()=>console.log("Audio play blocked by browser."));
+                    else audioRef.current.pause();
+                }
+            }, [isMusicPlaying, assets.bgAudio]);
+
+            useEffect(() => {
+                const init = async () => {
+                    await DB.init();
+                    const stateData = await DB.get('state', 'appData');
+                    if (stateData) {
+                        setDocState(stateData.docState);
+                        setSentences(stateData.sentences || []);
+                        setHighlights(stateData.highlights || []);
+                        setSettings(stateData.settings);
+                        setPlayback(p => ({ ...p, index: stateData.lastIndex || 0 }));
+                    } else {
+                        setSentences(Parser.tokenize(DEFAULT_WELCOME));
+                    }
+                    const bgI = await DB.get('assets', 'bgImage');
+                    const bgA = await DB.get('assets', 'bgAudio');
+                    setAssets({ bgImage: bgI ? URL.createObjectURL(bgI) : null, bgAudio: bgA ? URL.createObjectURL(bgA) : null });
+                    setHistory((await DB.getAll('history')).reverse());
+                };
+                init();
+                const loadVoices = () => setVoices(synth.current.getVoices().sort((a,b) => a.lang.localeCompare(b.lang)));
+                loadVoices(); synth.current.onvoiceschanged = loadVoices;
+                
+                const fsHandler = () => setUiState(s => ({ ...s, isFullscreen: !!document.fullscreenElement }));
+                document.addEventListener('fullscreenchange', fsHandler);
+                return () => document.removeEventListener('fullscreenchange', fsHandler);
+            }, []);
+
+            useEffect(() => {
+                DB.set('state', 'appData', { docState, sentences, highlights, settings, lastIndex: playback.index });
+            }, [docState, sentences, highlights, settings, playback.index]);
+
+            const speak = useCallback((index) => {
+                synth.current.cancel(); setActiveWord(null);
+                
+                if (!sentences || sentences.length === 0) {
+                    setPlayback({ index: 0, isPlaying: false });
+                    return;
+                }
+                
+                if (index >= sentences.length) return setPlayback({ index: 0, isPlaying: false });
+                
+                const text = sentences[index].text;
+                const u = new SpeechSynthesisUtterance(text);
+                u.rate = settings.rate;
+                const voice = voices.find(v => v.voiceURI === settings.voiceURI);
+                if (voice) u.voice = voice;
+
+                u.onboundary = (e) => {
+                    if (e.name === 'word') {
+                        const wordLen = text.substring(e.charIndex).match(/^\S+/)?.[0].length || 0;
+                        setActiveWord({ start: e.charIndex, end: e.charIndex + wordLen });
+                    }
+                };
+                u.onend = () => {
+                    setPlayback(prev => {
+                        if (!prev.isPlaying) return prev;
+                        const next = prev.index + 1;
+                        if (next < sentences.length) { setTimeout(() => speak(next), text.endsWith('\n')?400:50); return { ...prev, index: next }; }
+                        return { index: 0, isPlaying: false };
+                    });
+                };
+                u.onerror = (e) => { if(e.error !== 'interrupted') setPlayback(p => ({ ...p, isPlaying: false })); };
+                
+                utteranceRef.current = u; synth.current.speak(u);
+            }, [sentences, settings.rate, settings.voiceURI, voices]);
+
+            useEffect(() => {
+                if (playback.isPlaying) speak(playback.index);
+                else synth.current.cancel();
+            }, [playback.isPlaying, speak]);
+
+            const handleSeek = (idx) => { setPlayback({ index: idx, isPlaying: true }); };
+
+            const closeDocument = () => {
+                setDocState({ id: 'welcome', type: 'text', content: DEFAULT_WELCOME, title: "Welcome" });
+                setSentences(Parser.tokenize(DEFAULT_WELCOME));
+                setHighlights([]);
+                setPlayback({ index: 0, isPlaying: false });
+                setUiState(s => ({ ...s, sidebarOpen: false }));
+            };
+
+            const loadContent = async (newDocState) => {
+                setIsLoading(true);
+                await DB.addHistory(docState);
+                
+                setPlayback({ index: 0, isPlaying: false }); 
+                setHighlights([]); 
+                setHtmlMod(null);
+                setUiState(s => ({ ...s, sidebarOpen: false })); // Auto-close sidebar on load
+                
+                newDocState.id = Date.now().toString();
+                
+                if (newDocState.type === 'text') {
+                    setSentences(Parser.tokenize(newDocState.content));
+                } else {
+                    setSentences([]);
+                }
+                
+                setDocState(newDocState);
+                setHistory((await DB.getAll('history')).reverse());
+                setIsLoading(false);
+            };
+
+            const handleFile = async (e) => {
+                const file = e.target.files[0]; if (!file) return;
+                setIsLoading(true);
+                try {
+                    const ext = file.name.split('.').pop().toLowerCase();
+                    if (ext === 'epub') {
+                        const text = await Parser.parseEpub(file);
+                        await loadContent({ type: 'text', content: text, title: file.name });
+                    } else if (ext === 'html' || ext === 'htm') {
+                        const text = await file.text();
+                        await loadContent({ type: 'web', content: text, title: file.name });
+                    } else {
+                        await loadContent({ type: 'text', content: await file.text(), title: file.name });
+                    }
+                } catch (err) {
+                    alert("Failed to load file: " + err.message);
+                } finally {
+                    setIsLoading(false);
+                    e.target.value = '';
+                }
+            };
+
+            const loadUrl = async (url) => {
+                if(!url) return;
+                setIsLoading(true);
+                try {
+                    let fetchUrl = url;
+                    if (url.includes('docs.google.com')) fetchUrl = `${url.split('/edit')[0]}/export?format=html`;
+                    
+                    let html = "";
+                    let res = await fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(fetchUrl)}`).catch(() => null);
+                    
+                    if (res && res.ok) {
+                        html = await res.text();
+                    } else {
+                        res = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(fetchUrl)}`).catch(() => null);
+                        if (res && res.ok) {
+                            const data = await res.json();
+                            if (data.contents) html = data.contents;
+                        }
+                    }
+
+                    if (!html) throw new Error("Blocked by target site or proxies are offline.");
+                    
+                    const parser = new DOMParser();
+                    const doc = parser.parseFromString(html, 'text/html');
+                    doc.querySelectorAll('script, iframe, noscript, object, embed').forEach(el => el.remove());
+                    
+                    const baseUrl = new URL(url).origin;
+                    doc.querySelectorAll('[href], [src]').forEach(el => {
+                        try {
+                            if(el.hasAttribute('href')) el.setAttribute('href', new URL(el.getAttribute('href'), baseUrl).href);
+                            if(el.hasAttribute('src')) el.setAttribute('src', new URL(el.getAttribute('src'), baseUrl).href);
+                        } catch(e){}
+                    });
+                    
+                    await loadContent({ type: 'web', content: doc.documentElement.outerHTML, title: doc.title || "Web Article" });
+                } catch (e) { 
+                    alert(`Failed to load URL: ${e.message}\n\nTry pasting the content manually instead.`); 
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+
+            const exportDocument = async () => {
+                if (docState.type === 'web') {
+                     const converted = window.htmlDocx.asBlob(htmlMod || docState.content);
+                     const a = document.createElement('a'); a.href = URL.createObjectURL(converted); a.download = `Exported.docx`; a.click();
+                } else {
+                     Parser.exportDocx(docState.content, highlights, settings);
+                }
+            };
+
+            const deleteFromLibrary = async (id) => {
+                await DB.delete('history', id);
+                setHistory((await DB.getAll('history')).reverse());
+            };
+
+            return (
+                <div className={`flex h-screen w-screen overflow-hidden ${assets.bgImage ? 'bg-transparent' : (uiState.isFullscreen ? 'bg-white' : 'bg-gray-50')}`}>
+                    {/* Ambience Layers */}
+                    {assets.bgImage && <div className="fixed inset-0 z-0 bg-cover bg-center opacity-90 pointer-events-none" style={{ backgroundImage: `url(${assets.bgImage})` }} />}
+                    {assets.bgImage && <div className="fixed inset-0 z-0 bg-white/60 pointer-events-none" />}
+                    <audio ref={audioRef} loop className="hidden" src={assets.bgAudio} />
+
+                    {/* Loader Overlay */}
+                    {isLoading && (
+                        <div className="absolute inset-0 z-[100] bg-white/80 backdrop-blur-sm flex items-center justify-center flex-col gap-4">
+                            <div className="animate-spin rounded-full h-10 w-10 sm:h-12 sm:w-12 border-b-4 border-indigo-600"></div>
+                            <div className="text-xs sm:text-sm font-medium text-gray-500 font-mono">Loading Document...</div>
+                        </div>
+                    )}
+
+                    {/* Mobile Sidebar Overlay Backdrop */}
+                    {uiState.sidebarOpen && (
+                        <div 
+                            className="fixed inset-0 bg-black/20 backdrop-blur-sm z-40 lg:hidden"
+                            onClick={() => setUiState(s => ({ ...s, sidebarOpen: false }))}
+                        />
+                    )}
+
+                    {/* Main Workspace */}
+                    <div className={`relative flex-1 flex flex-col transition-all duration-300 z-10 ${uiState.sidebarOpen ? 'lg:mr-80' : ''}`}>
+                        
+                        {/* Header */}
+                        {!uiState.isFullscreen && (
+                            <header className="h-14 sm:h-16 bg-white/90 backdrop-blur border-b border-gray-200 px-3 sm:px-6 flex items-center justify-between shrink-0 shadow-sm z-20">
+                                <div className="flex items-center gap-2 sm:gap-3">
+                                    <div className="w-7 h-7 sm:w-8 sm:h-8 bg-indigo-600 rounded flex items-center justify-center text-white font-serif font-bold text-base sm:text-lg">L</div>
+                                    <div className="flex items-center gap-1 sm:gap-2">
+                                        <h1 className="font-semibold text-sm sm:text-base text-gray-800 tracking-tight truncate max-w-[140px] sm:max-w-xs">{docState.title}</h1>
+                                        {docState.id !== 'welcome' && (
+                                            <button onClick={closeDocument} className="p-1.5 sm:p-2 hover:bg-gray-100 rounded text-gray-400 hover:text-red-500 transition-colors" title="Close Document">
+                                                <svg className="w-4 h-4 sm:w-5 sm:h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                            </button>
+                                        )}
+                                    </div>
+                                </div>
+                                <div className="flex items-center gap-1 sm:gap-2">
+                                    {docState.type === 'text' && (
+                                        <button onClick={() => setUiState(s => ({ ...s, isEditMode: !s.isEditMode }))} className={`p-2 rounded-full ${uiState.isEditMode?'bg-indigo-100 text-indigo-700':'text-gray-500 hover:bg-gray-100'}`} title="Edit Text">
+                                            <svg className="w-4 h-4 sm:w-5 sm:h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
+                                        </button>
+                                    )}
+                                    <button onClick={() => !document.fullscreenElement ? document.documentElement.requestFullscreen() : document.exitFullscreen()} className="p-2 text-gray-500 hover:bg-gray-100 rounded-full" title="Fullscreen">
+                                        <svg className="w-4 h-4 sm:w-5 sm:h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" /></svg>
+                                    </button>
+                                    <button onClick={() => setUiState(s => ({ ...s, sidebarOpen: !s.sidebarOpen }))} className={`p-2 rounded-full ${uiState.sidebarOpen?'bg-gray-200':'text-gray-500 hover:bg-gray-100'}`}>
+                                        <svg className="w-5 h-5 sm:w-6 sm:h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h7" /></svg>
+                                    </button>
+                                </div>
+                            </header>
+                        )}
+
+                        {/* Fullscreen Quick Exit */}
+                        {uiState.isFullscreen && (
+                            <button onClick={() => document.exitFullscreen()} className="fixed top-4 right-4 sm:top-6 sm:right-6 p-2 sm:p-3 bg-black/10 hover:bg-black/20 text-gray-500 rounded-full z-50 transition-colors">
+                                <svg className="w-4 h-4 sm:w-5 sm:h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                            </button>
+                        )}
+
+                        {/* Content Area */}
+                        <main className="flex-1 overflow-y-auto">
+                            {uiState.isEditMode && docState.type === 'text' ? (
+                                <div className="p-4 sm:p-10 max-w-4xl mx-auto h-full">
+                                    <textarea 
+                                        className="w-full h-full p-4 sm:p-6 bg-white shadow-inner border border-gray-200 rounded-xl resize-none outline-none font-mono text-sm sm:text-base text-gray-700 leading-relaxed"
+                                        value={docState.content}
+                                        onChange={e => loadContent({ ...docState, content: e.target.value })}
+                                        placeholder="Paste text here..."
+                                    />
+                                </div>
+                            ) : (
+                                <>
+                                    {docState.type === 'web' && <WebViewer key={docState.id} htmlContent={docState.content} playbackIndex={playback.index} isPlaying={playback.isPlaying} onSentencesReady={setSentences} onAddHighlight={setHtmlMod} onSeek={handleSeek} />}
+                                    {docState.type === 'text' && <TextViewer key={docState.id} text={docState.content} sentences={sentences} playbackIndex={playback.index} isPlaying={playback.isPlaying} activeWord={activeWord} highlights={highlights} onHighlight={hl => setHighlights(p => [...p, hl])} onSeek={handleSeek} settings={settings} />}
+                                </>
+                            )}
+                        </main>
+
+                        {/* Bottom Controller (Responsive Column/Row Setup) */}
+                        {!uiState.isFullscreen && !uiState.isEditMode && (
+                            <div className="bg-white/90 backdrop-blur border-t border-gray-200 py-3 sm:py-0 sm:h-20 px-4 sm:px-6 flex flex-col sm:flex-row items-center justify-between shrink-0 shadow-[0_-4px_20px_rgba(0,0,0,0.05)] z-20 gap-3 sm:gap-0">
+                                <div className="w-full sm:flex-1 max-w-xl flex items-center gap-3 sm:gap-4">
+                                    <span className="text-[10px] sm:text-xs text-gray-400 font-mono w-8 sm:w-10 text-right">{sentences.length > 0 ? playback.index + 1 : 0}</span>
+                                    <input type="range" min="0" max={Math.max(0, sentences.length - 1)} value={playback.index} onChange={(e) => handleSeek(parseInt(e.target.value))} className="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-indigo-600" />
+                                    <span className="text-[10px] sm:text-xs text-gray-400 font-mono w-8 sm:w-10">{sentences.length}</span>
+                                </div>
+                                <div className="flex items-center justify-center gap-4 sm:ml-8 w-full sm:w-auto">
+                                    <button onClick={() => handleSeek(Math.max(0, playback.index - 1))} className="p-2 sm:p-3 text-gray-600 hover:bg-gray-100 rounded-full transition-colors">
+                                        <svg className="w-5 h-5 sm:w-6 sm:h-6 fill-current" viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>
+                                    </button>
+                                    <button onClick={() => setPlayback(p => ({ ...p, isPlaying: !p.isPlaying }))} disabled={sentences.length === 0} className={`w-12 h-12 sm:w-14 sm:h-14 ${sentences.length === 0 ? 'bg-gray-400 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700'} text-white rounded-full flex items-center justify-center shadow-lg transition-transform active:scale-95`}>
+                                        {playback.isPlaying ? <svg className="w-6 h-6 sm:w-8 sm:h-8 fill-current" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg> : <svg className="w-6 h-6 sm:w-8 sm:h-8 fill-current translate-x-0.5" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>}
+                                    </button>
+                                    <button onClick={() => handleSeek(Math.min(sentences.length - 1, playback.index + 1))} className="p-2 sm:p-3 text-gray-600 hover:bg-gray-100 rounded-full transition-colors">
+                                        <svg className="w-5 h-5 sm:w-6 sm:h-6 fill-current" viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Right Sidebar */}
+                    <aside className={`fixed top-0 right-0 h-full w-[85%] sm:w-80 bg-white border-l border-gray-200 shadow-2xl transform transition-transform duration-300 z-50 flex flex-col ${uiState.sidebarOpen ? 'translate-x-0' : 'translate-x-full'}`}>
+                        <div className="p-4 sm:p-5 border-b border-gray-100 flex justify-between items-center bg-gray-50/50">
+                            <h2 className="font-bold text-gray-800 text-sm sm:text-base">Menu</h2>
+                            <button onClick={() => setUiState(s => ({ ...s, sidebarOpen: false }))} className="p-2 text-gray-400 hover:text-gray-800 rounded-full hover:bg-gray-200"><svg className="w-4 h-4 sm:w-5 sm:h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg></button>
+                        </div>
+                        
+                        <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-6 sm:space-y-8">
+                            
+                            {/* Import */}
+                            <section>
+                                <h3 className="text-[10px] sm:text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2 sm:mb-3">Import Source</h3>
+                                <div className="space-y-3">
+                                    <label className="flex items-center justify-center px-4 py-3 border-2 border-dashed border-gray-300 rounded-xl hover:border-indigo-500 hover:bg-indigo-50 cursor-pointer transition-colors text-xs sm:text-sm font-medium text-gray-600">
+                                        Upload File (EPUB/HTML/TXT)
+                                        <input type="file" accept=".epub,.html,.htm,.txt" className="hidden" onChange={handleFile} />
+                                    </label>
+                                    <div className="flex gap-2">
+                                        <input type="url" id="urlInput" placeholder="Google Doc or Web URL" className="flex-1 p-2 border border-gray-200 rounded-lg text-xs sm:text-sm outline-none focus:ring-2 focus:ring-indigo-500 bg-gray-50" onKeyDown={e => e.key==='Enter' && loadUrl(e.target.value)} />
+                                        <button onClick={() => loadUrl(document.getElementById('urlInput').value)} className="px-3 py-2 bg-indigo-600 text-white rounded-lg text-xs sm:text-sm hover:bg-indigo-700">Go</button>
+                                    </div>
+                                </div>
+                            </section>
+
+                            {/* Library Management */}
+                            <section>
+                                <h3 className="text-[10px] sm:text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2 sm:mb-3">Library (Saved Files)</h3>
+                                <div className="border border-gray-200 rounded-lg max-h-48 sm:max-h-64 overflow-y-auto bg-gray-50">
+                                    {history.map((item) => (
+                                        <div key={item.id} className="p-3 border-b border-gray-100 last:border-0 hover:bg-gray-100 flex justify-between items-center group">
+                                            <div onClick={() => loadContent(item.docState)} className="cursor-pointer overflow-hidden flex-1 mr-2">
+                                                <div className="text-xs sm:text-sm font-medium text-gray-700 truncate">{item.title}</div>
+                                                <div className="text-[9px] sm:text-[10px] text-gray-400 font-mono mt-0.5">{new Date(item.date).toLocaleDateString()} • {item.docState.type.toUpperCase()}</div>
+                                            </div>
+                                            <button onClick={(e) => { e.stopPropagation(); deleteFromLibrary(item.id); }} className="text-gray-400 hover:text-red-500 p-1.5 rounded-md hover:bg-red-50 opacity-100 sm:opacity-0 group-hover:opacity-100 transition-opacity" title="Remove from library">
+                                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                                            </button>
+                                        </div>
+                                    ))}
+                                    {history.length === 0 && <div className="p-4 text-xs text-gray-400 text-center">Your library is empty</div>}
+                                </div>
+                            </section>
+
+                            {/* Speech Settings */}
+                            <section>
+                                <h3 className="text-[10px] sm:text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2 sm:mb-3">Speech Settings</h3>
+                                <div className="space-y-4">
+                                    <div>
+                                        <label className="flex justify-between text-xs text-gray-500 mb-2">
+                                            <span>Reading Speed</span>
+                                            <span className="font-bold text-indigo-600">{settings.rate}x</span>
+                                        </label>
+                                        <input type="range" min="0.5" max="2.5" step="0.25" value={settings.rate} onChange={e => setSettings(s => ({ ...s, rate: parseFloat(e.target.value) }))} className="w-full h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-indigo-600" />
+                                    </div>
+                                    <select className="w-full p-2 bg-gray-50 border border-gray-200 rounded-lg text-xs sm:text-sm outline-none" value={settings.voiceURI} onChange={e => setSettings(s => ({ ...s, voiceURI: e.target.value }))}>
+                                        <option value="">System Default Voice</option>
+                                        {voices.map(v => <option key={v.voiceURI} value={v.voiceURI}>{v.name} ({v.lang})</option>)}
+                                    </select>
+                                </div>
+                            </section>
+
+                            {/* Typography */}
+                            {docState.type === 'text' && (
+                                <section>
+                                    <h3 className="text-[10px] sm:text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2 sm:mb-3">Typography</h3>
+                                    <div className="space-y-3">
+                                        <div>
+                                            <label className="block text-xs text-gray-500 mb-1">Text Size: {settings.textSize}px</label>
+                                            <input type="range" min="14" max="32" value={settings.textSize} onChange={e => setSettings(s => ({ ...s, textSize: parseInt(e.target.value) }))} className="w-full h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-indigo-600" />
+                                        </div>
+                                        <select className="w-full p-2 bg-gray-50 border border-gray-200 rounded-lg text-xs sm:text-sm outline-none" value={settings.fontFamily} onChange={e => setSettings(s => ({ ...s, fontFamily: e.target.value }))}>
+                                            {[ {id:'serif', n:'Merriweather'}, {id:'inter', n:'Inter'}, {id:'playfair', n:'Playfair'}, {id:'cormorant', n:'Cormorant'}, {id:'lora', n:'Lora'}, {id:'montserrat', n:'Montserrat'} ].map(f => <option key={f.id} value={f.id}>{f.n}</option>)}
+                                        </select>
+                                    </div>
+                                </section>
+                            )}
+
+                            {/* Ambience */}
+                            <section>
+                                <h3 className="text-[10px] sm:text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2 sm:mb-3">Ambience</h3>
+                                <div className="space-y-2">
+                                    <label className="block w-full p-2 border border-gray-200 rounded-lg text-xs sm:text-sm text-center cursor-pointer hover:bg-gray-50 transition-colors">Set Background Image <input type="file" accept="image/*" hidden onChange={async e => { const f = e.target.files[0]; if(f){ await DB.set('assets', 'bgImage', f); setAssets(a => ({...a, bgImage: URL.createObjectURL(f)})); } }} /></label>
+                                    <label className="block w-full p-2 border border-gray-200 rounded-lg text-xs sm:text-sm text-center cursor-pointer hover:bg-gray-50 transition-colors">Set Background Audio <input type="file" accept="audio/*" hidden onChange={async e => { const f = e.target.files[0]; if(f){ await DB.set('assets', 'bgAudio', f); setAssets(a => ({...a, bgAudio: URL.createObjectURL(f)})); setIsMusicPlaying(true); } }} /></label>
+                                    
+                                    {assets.bgAudio && (
+                                        <div className="flex items-center justify-between px-3 py-2 bg-indigo-50 border border-indigo-100 rounded-lg mt-2">
+                                            <span className="text-[10px] sm:text-xs text-indigo-700 font-medium flex items-center gap-2">
+                                                {isMusicPlaying ? <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span> : <span className="w-2 h-2 rounded-full bg-gray-400"></span>}
+                                                Music {isMusicPlaying ? 'Playing' : 'Paused'}
+                                            </span>
+                                            <button onClick={() => setIsMusicPlaying(!isMusicPlaying)} className="px-3 py-1 bg-white border border-indigo-200 text-indigo-600 rounded-md text-[10px] sm:text-xs font-semibold hover:bg-indigo-600 hover:text-white transition-colors">
+                                                {isMusicPlaying ? 'Pause' : 'Play'}
+                                            </button>
+                                        </div>
+                                    )}
+
+                                    {(assets.bgImage || assets.bgAudio) && <button onClick={async () => { await DB.delete('assets', 'bgImage'); await DB.delete('assets', 'bgAudio'); setAssets({bgImage: null, bgAudio: null}); setIsMusicPlaying(false); }} className="w-full text-xs text-red-500 hover:underline pt-2">Clear Ambience</button>}
+                                </div>
+                            </section>
+
+                            {/* Export */}
+                            <section>
+                                <h3 className="text-[10px] sm:text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2 sm:mb-3">Export ({highlights.length} Highlights)</h3>
+                                <button onClick={exportDocument} className="w-full py-2 bg-gray-50 text-gray-700 border border-gray-200 rounded-lg text-xs sm:text-sm font-medium hover:bg-gray-100 flex items-center justify-center gap-2 transition-colors">
+                                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4-4m0 0l-4-4m4 4V4" /></svg>
+                                    Export Annotated Doc
+                                </button>
+                            </section>
+
+                        </div>
+                    </aside>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
