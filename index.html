@@ -16,6 +16,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <!-- DOCX Generation -->
     <script src="https://cdn.jsdelivr.net/npm/html-docx-js@0.3.1/dist/html-docx.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
 
     <!-- Fonts -->
     <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600&family=Inter:wght@300;400;500;600&family=Lora:ital,wght@0,400;0,600;1,400&family=Merriweather:wght@300;400;700&family=Montserrat:wght@300;400;500&family=Playfair+Display:wght@400;700&display=swap" rel="stylesheet">
@@ -282,26 +283,20 @@
 
         const WebViewer = ({ htmlContent, isPlaying, playbackIndex, onSentencesReady, onHighlightCmd, onAddHighlight, onSeek }) => {
             const iframeRef = useRef(null);
-            
-            useEffect(() => {
-                const doc = iframeRef.current?.contentDocument;
-                if(doc) { 
-                    doc.open(); 
-                    
-                    let finalHtml = htmlContent;
-                    const scriptTag = getIframeScript();
-                    
-                    if (finalHtml.includes('</head>')) {
-                        finalHtml = finalHtml.replace('</head>', scriptTag + '</head>');
-                    } else if (finalHtml.includes('</body>')) {
-                        finalHtml = finalHtml.replace('</body>', scriptTag + '</body>');
-                    } else {
-                        finalHtml += scriptTag;
-                    }
-                    
-                    doc.write(finalHtml); 
-                    doc.close(); 
+
+            const iframeSrcDoc = useMemo(() => {
+                let finalHtml = htmlContent;
+                const scriptTag = getIframeScript();
+
+                if (finalHtml.includes('</head>')) {
+                    finalHtml = finalHtml.replace('</head>', scriptTag + '</head>');
+                } else if (finalHtml.includes('</body>')) {
+                    finalHtml = finalHtml.replace('</body>', scriptTag + '</body>');
+                } else {
+                    finalHtml += scriptTag;
                 }
+
+                return finalHtml;
             }, [htmlContent]);
 
             useEffect(() => {
@@ -317,7 +312,7 @@
             useEffect(() => { if (isPlaying) iframeRef.current?.contentWindow?.postMessage({ type: 'PLAY', index: playbackIndex }, '*'); }, [isPlaying, playbackIndex]);
             useEffect(() => { if (onHighlightCmd) iframeRef.current?.contentWindow?.postMessage({ type: 'HIGHLIGHT', color: onHighlightCmd }, '*'); }, [onHighlightCmd]);
             
-            return <iframe ref={iframeRef} className="w-full h-full border-none bg-white" sandbox="allow-same-origin allow-scripts" />;
+            return <iframe ref={iframeRef} className="w-full h-full border-none bg-white" sandbox="allow-scripts" srcDoc={iframeSrcDoc} />;
         };
 
         const TextViewer = ({ text, sentences, playbackIndex, isPlaying, activeWord, highlights, onHighlight, onSeek, settings }) => {
@@ -430,6 +425,63 @@
 
         // --- MAIN APP ---
         const DEFAULT_WELCOME = "Welcome to Lumina Reader Ultimate.\n\nUse the sidebar to import Webpages, EPUBs, or Google Docs. You can highlight text, change fonts, and export to DOCX/PDF.\n\nLumina seamlessly adapts to your screen layout and preserves spacing while reading aloud.";
+
+        const sanitizeImportedHtml = (rawHtml, { baseUrl = null } = {}) => {
+            if (!rawHtml) return '<!doctype html><html><head></head><body></body></html>';
+            if (!window.DOMPurify) throw new Error('Sanitizer failed to initialize.');
+
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(rawHtml, 'text/html');
+
+            doc.querySelectorAll('base').forEach(el => el.remove());
+
+            if (baseUrl) {
+                doc.querySelectorAll('[href], [src]').forEach(el => {
+                    try {
+                        if (el.hasAttribute('href')) el.setAttribute('href', new URL(el.getAttribute('href'), baseUrl).href);
+                        if (el.hasAttribute('src')) el.setAttribute('src', new URL(el.getAttribute('src'), baseUrl).href);
+                    } catch (e) {}
+                });
+            }
+
+            const policy = {
+                WHOLE_DOCUMENT: true,
+                ALLOW_DATA_ATTR: false,
+                ALLOW_ARIA_ATTR: false,
+                ALLOW_UNKNOWN_PROTOCOLS: false,
+                USE_PROFILES: { html: true },
+                FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'noscript', 'svg', 'math', 'form', 'input', 'button', 'textarea', 'select', 'option', 'meta', 'link', 'style', 'base'],
+                FORBID_ATTR: ['srcdoc', 'xmlns', 'xmlns:xlink', 'xlink:href', 'action', 'formaction', 'onload', 'onerror'],
+                ALLOWED_TAGS: ['html', 'head', 'body', 'article', 'section', 'main', 'header', 'footer', 'nav', 'aside', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'span', 'div', 'blockquote', 'pre', 'code', 'hr', 'br', 'strong', 'b', 'em', 'i', 'u', 'small', 'mark', 'sup', 'sub', 'a', 'img', 'figure', 'figcaption', 'ul', 'ol', 'li', 'dl', 'dt', 'dd', 'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td'],
+                ALLOWED_ATTR: ['href', 'src', 'alt', 'title', 'width', 'height', 'class', 'id', 'lang', 'dir', 'aria-label', 'aria-hidden', 'role', 'colspan', 'rowspan', 'scope', 'target', 'rel', 'loading', 'decoding']
+            };
+
+            window.DOMPurify.removeAllHooks();
+            window.DOMPurify.addHook('uponSanitizeAttribute', (node, data) => {
+                const attrName = (data.attrName || '').toLowerCase();
+                const value = (data.attrValue || '').trim();
+                const lowerValue = value.toLowerCase();
+
+                if (attrName.startsWith('on')) {
+                    data.keepAttr = false;
+                    return;
+                }
+
+                if (['href', 'src', 'xlink:href', 'action', 'formaction'].includes(attrName)) {
+                    if (/^(javascript:|data:)/i.test(lowerValue)) data.keepAttr = false;
+                }
+
+                if (attrName === 'target' && lowerValue === '_blank') {
+                    node.setAttribute('rel', 'noopener noreferrer');
+                }
+            });
+
+            const cleanNode = window.DOMPurify.sanitize(doc.documentElement.outerHTML, { ...policy, RETURN_DOM: true });
+            const cleanHtml = cleanNode?.outerHTML || new XMLSerializer().serializeToString(cleanNode);
+            window.DOMPurify.removeAllHooks();
+
+            return cleanHtml || '<!doctype html><html><head></head><body></body></html>';
+        };
 
         const App = () => {
             const [isLoading, setIsLoading] = useState(false);
@@ -572,7 +624,8 @@
                         await loadContent({ type: 'text', content: text, title: file.name });
                     } else if (ext === 'html' || ext === 'htm') {
                         const text = await file.text();
-                        await loadContent({ type: 'web', content: text, title: file.name });
+                        const sanitizedHtml = sanitizeImportedHtml(text);
+                        await loadContent({ type: 'web', content: sanitizedHtml, title: file.name });
                     } else {
                         await loadContent({ type: 'text', content: await file.text(), title: file.name });
                     }
@@ -608,17 +661,10 @@
                     
                     const parser = new DOMParser();
                     const doc = parser.parseFromString(html, 'text/html');
-                    doc.querySelectorAll('script, iframe, noscript, object, embed').forEach(el => el.remove());
+                    const baseUrl = new URL(fetchUrl).origin;
+                    const sanitizedHtml = sanitizeImportedHtml(doc.documentElement.outerHTML, { baseUrl });
                     
-                    const baseUrl = new URL(url).origin;
-                    doc.querySelectorAll('[href], [src]').forEach(el => {
-                        try {
-                            if(el.hasAttribute('href')) el.setAttribute('href', new URL(el.getAttribute('href'), baseUrl).href);
-                            if(el.hasAttribute('src')) el.setAttribute('src', new URL(el.getAttribute('src'), baseUrl).href);
-                        } catch(e){}
-                    });
-                    
-                    await loadContent({ type: 'web', content: doc.documentElement.outerHTML, title: doc.title || "Web Article" });
+                    await loadContent({ type: 'web', content: sanitizedHtml, title: doc.title || "Web Article" });
                 } catch (e) { 
                     alert(`Failed to load URL: ${e.message}\n\nTry pasting the content manually instead.`); 
                 } finally {
