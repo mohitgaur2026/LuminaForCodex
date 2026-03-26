@@ -516,6 +516,12 @@
         };
 
         const App = () => {
+            const COLD_STATE_KEY = 'appData:cold';
+            const PLAYBACK_STATE_KEY = 'appData:playback';
+            const LEGACY_STATE_KEY = 'appData';
+            const COLD_WRITE_DEBOUNCE_MS = 600;
+            const PLAYBACK_WRITE_INTERVAL_MS = 3000;
+
             const [isLoading, setIsLoading] = useState(false);
             const [docState, setDocState] = useState({ id: 'welcome', type: 'text', content: DEFAULT_WELCOME, title: "Welcome" });
             const [sentences, setSentences] = useState([]);
@@ -535,6 +541,12 @@
             const synth = useRef(window.speechSynthesis);
             const utteranceRef = useRef(null);
             const audioRef = useRef(null);
+            const coldWriteTimerRef = useRef(null);
+            const lastColdPayloadRef = useRef('');
+            const latestColdPayloadRef = useRef(null);
+            const latestColdSerializedRef = useRef('');
+            const lastPlaybackPayloadRef = useRef('');
+            const lastPlaybackPersistAtRef = useRef(0);
 
             useEffect(() => {
                 if (audioRef.current) {
@@ -546,13 +558,20 @@
             useEffect(() => {
                 const init = async () => {
                     await DB.init();
-                    const stateData = await DB.get('state', 'appData');
-                    if (stateData) {
-                        setDocState(stateData.docState);
-                        setSentences(stateData.sentences || []);
-                        setHighlights(stateData.highlights || []);
-                        setSettings(stateData.settings);
-                        setPlayback(p => ({ ...p, index: stateData.lastIndex || 0 }));
+                    const [coldStateData, playbackStateData, legacyStateData] = await Promise.all([
+                        DB.get('state', COLD_STATE_KEY),
+                        DB.get('state', PLAYBACK_STATE_KEY),
+                        DB.get('state', LEGACY_STATE_KEY)
+                    ]);
+                    const restoredColdState = coldStateData || legacyStateData;
+                    const restoredPlaybackIndex = playbackStateData?.lastIndex ?? legacyStateData?.lastIndex ?? 0;
+
+                    if (restoredColdState) {
+                        setDocState(restoredColdState.docState);
+                        setSentences(restoredColdState.sentences || []);
+                        setHighlights(restoredColdState.highlights || []);
+                        setSettings(restoredColdState.settings || { rate: 1.0, voiceURI: '', textSize: 18, fontFamily: 'serif' });
+                        setPlayback(p => ({ ...p, index: restoredPlaybackIndex }));
                     } else {
                         setSentences(Parser.tokenize(DEFAULT_WELCOME));
                     }
@@ -571,8 +590,72 @@
             }, []);
 
             useEffect(() => {
-                DB.set('state', 'appData', { docState, sentences, highlights, settings, lastIndex: playback.index });
-            }, [docState, sentences, highlights, settings, playback.index]);
+                const payload = { docState, sentences, highlights, settings };
+                const serializedPayload = JSON.stringify(payload);
+                latestColdPayloadRef.current = payload;
+                latestColdSerializedRef.current = serializedPayload;
+                if (serializedPayload === lastColdPayloadRef.current) return;
+
+                if (coldWriteTimerRef.current) clearTimeout(coldWriteTimerRef.current);
+                coldWriteTimerRef.current = setTimeout(async () => {
+                    if (serializedPayload === lastColdPayloadRef.current) return;
+                    await DB.set('state', COLD_STATE_KEY, payload);
+                    lastColdPayloadRef.current = serializedPayload;
+                }, COLD_WRITE_DEBOUNCE_MS);
+
+                return () => {
+                    if (coldWriteTimerRef.current) clearTimeout(coldWriteTimerRef.current);
+                };
+            }, [docState, sentences, highlights, settings]);
+
+            const persistPlayback = useCallback((force = false) => {
+                const payload = { lastIndex: playback.index };
+                const serializedPayload = JSON.stringify(payload);
+                const now = Date.now();
+                const elapsed = now - lastPlaybackPersistAtRef.current;
+
+                if (serializedPayload === lastPlaybackPayloadRef.current) return;
+                if (!force && elapsed < PLAYBACK_WRITE_INTERVAL_MS) return;
+
+                DB.set('state', PLAYBACK_STATE_KEY, payload);
+                lastPlaybackPayloadRef.current = serializedPayload;
+                lastPlaybackPersistAtRef.current = now;
+            }, [playback.index]);
+
+            useEffect(() => {
+                persistPlayback(false);
+            }, [playback.index, persistPlayback]);
+
+            useEffect(() => {
+                if (!playback.isPlaying) persistPlayback(true);
+            }, [playback.isPlaying, persistPlayback]);
+
+            useEffect(() => {
+                const flushPlayback = () => persistPlayback(true);
+                window.addEventListener('beforeunload', flushPlayback);
+                window.addEventListener('pagehide', flushPlayback);
+                return () => {
+                    window.removeEventListener('beforeunload', flushPlayback);
+                    window.removeEventListener('pagehide', flushPlayback);
+                };
+            }, [persistPlayback]);
+
+            useEffect(() => {
+                const flushColdState = () => {
+                    if (coldWriteTimerRef.current) clearTimeout(coldWriteTimerRef.current);
+                    if (latestColdSerializedRef.current === lastColdPayloadRef.current) return;
+                    if (!latestColdPayloadRef.current) return;
+                    DB.set('state', COLD_STATE_KEY, latestColdPayloadRef.current);
+                    lastColdPayloadRef.current = latestColdSerializedRef.current;
+                };
+
+                window.addEventListener('beforeunload', flushColdState);
+                window.addEventListener('pagehide', flushColdState);
+                return () => {
+                    window.removeEventListener('beforeunload', flushColdState);
+                    window.removeEventListener('pagehide', flushColdState);
+                };
+            }, []);
 
             const speak = useCallback((index) => {
                 synth.current.cancel(); setActiveWord(null);
